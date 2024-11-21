@@ -1,0 +1,85 @@
+################################
+##  CONFIGURATION             ##
+################################
+
+variables:
+  DOCKER_TLS_CERTDIR: ""
+  # Update cluster name
+  CLUSTER_NAME: "test-cluster-QVFPpWtx"
+
+
+.install_awscli: &install_awscli |
+  apk add --no-cache curl python3
+  curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+  python3 get-pip.py pip==21.1.1
+  pip install awscli --upgrade
+
+.kubectl_config: &kubectl_config
+- aws eks --region ${AWS_DEFAULT_REGION} update-kubeconfig --name ${CLUSTER_NAME}
+
+################################
+##  CI/CD PIPELINE            ##
+################################
+
+stages:
+- test
+- build
+- deploy
+
+
+build-and-test-app:
+  stage: test
+  image: golang:alpine
+  before_script:
+    - apk add bash ca-certificates git gcc g++ libc-dev make
+    - go version
+  script:
+  - go get -d -v
+  - cd docker-gs-ping
+  - go build -o /docker-gs-ping
+  rules:
+  - when: always
+
+build-image:
+  stage: build
+  image: docker
+  services:
+    - docker:dind
+  before_script:
+    - *install_awscli
+    - aws --version
+    - docker --version
+  script:
+  - echo ${CI_COMMIT_REF_NAME} > VERSION
+  - export VERSION_TAG_K8s=$(echo ${CI_COMMIT_REF_NAME}_$(date +%Y%m%d_%H%M%S) | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-')
+  - export VERSION_IMAGE_K8S=${ECR_REPOSITORY}:${VERSION_TAG_K8s}
+  - echo ${VERSION_IMAGE_K8S}
+  - aws ecr get-login-password | docker login --username AWS --password-stdin ${ECR_REPOSITORY}
+  - cd docker-gs-ping
+  - docker pull ${ECR_REPOSITORY}:latest || true
+  - docker build -t ${VERSION_IMAGE_K8S} -t ${ECR_REPOSITORY}:latest .
+  - docker push ${VERSION_IMAGE_K8S}
+  - docker push ${ECR_REPOSITORY}:latest
+  - echo "DEPLOY_VERSION=${VERSION_TAG_K8s}" >> image.env
+  - echo "VERSION_IMAGE_K8S=${VERSION_IMAGE_K8S}" >> image.env
+  - cat image.env
+  artifacts:
+    paths: 
+      - image.env
+  rules:
+  - when: always
+
+
+deploy-to-k8s-cluster:
+  image: alpine/helm:3.11.1
+  stage: deploy
+  before_script:
+  - *install_awscli
+  - *kubectl_config
+  script:
+    - source image.env
+    - cd helm-charts
+    - sed -i "s|ECR_REPO_IMAGE|${VERSION_IMAGE_K8S}|g" sample-go-app/templates/deployment.yml
+    - helm install sample-go-app sample-go-app
+  only:
+    - main
